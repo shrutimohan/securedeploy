@@ -1,0 +1,81 @@
+# STAGE 2: build -> Trivy scan -> SBOM -> push -> Cosign keyless sign (+ SBOM attestation)
+name: build
+on:
+  push:
+    branches: [main, vuln-demo]
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # OIDC for AWS and for Cosign keyless signing
+  contents: read
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ENFORCE: ${{ vars.ENFORCE_GATES == 'true' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - uses: aws-actions/amazon-ecr-login@v2
+      - uses: sigstore/cosign-installer@v3.7.0
+      - uses: anchore/sbom-action/download-syft@v0
+
+      - name: Build images
+        run: |
+          mkdir -p out
+          TAG=${GITHUB_SHA::12}
+          docker build -t api:$TAG      app/api
+          docker build -t frontend:$TAG app/frontend
+          echo "TAG=$TAG" >> $GITHUB_ENV
+
+      - name: Trivy scan (fail on CRITICAL when enforcing)
+        uses: aquasecurity/trivy-action@0.28.0
+        continue-on-error: ${{ vars.ENFORCE_GATES != 'true' }}
+        with:
+          image-ref: api:${{ env.TAG }}
+          severity: CRITICAL
+          exit-code: '1'
+          format: json
+          output: out/trivy-api.json
+      - name: Trivy scan frontend
+        uses: aquasecurity/trivy-action@0.28.0
+        continue-on-error: ${{ vars.ENFORCE_GATES != 'true' }}
+        with:
+          image-ref: frontend:${{ env.TAG }}
+          severity: CRITICAL
+          exit-code: '1'
+          format: json
+          output: out/trivy-frontend.json
+
+      - name: SBOM (Syft, SPDX)
+        run: |
+          for n in api frontend; do syft $n:$TAG -o spdx-json=out/sbom-$n.spdx.json; done
+
+      - name: Push + sign by digest
+        run: |
+          REG=$(aws sts get-caller-identity --query Account --output text).dkr.ecr.$AWS_REGION.amazonaws.com
+          for n in api frontend; do
+            REPO=$REG/securedeploy-$n
+            docker tag $n:$TAG $REPO:$TAG
+            docker push $REPO:$TAG
+            DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' $REPO:$TAG)   # repo@sha256:...
+            echo "$DIGEST" > out/digest-$n.txt
+            cosign sign --yes "$DIGEST"                                                 # keyless, signs the digest not the tag
+            cosign attest --yes --type spdxjson --predicate out/sbom-$n.spdx.json "$DIGEST"
+          done
+          jq -n --arg sha "$GITHUB_SHA" --arg api "$(cat out/digest-api.txt)" --arg fe "$(cat out/digest-frontend.txt)" \
+             '{commit:$sha, api:$api, frontend:$fe}' > out/digests.json
+          cat out/digests.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-evidence
+          path: out/

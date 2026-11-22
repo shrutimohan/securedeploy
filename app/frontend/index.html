@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>SecureDeploy Demo</title></head>
+<body>
+  <h1>SecureDeploy Demo</h1>
+  <p><b>Intentionally vulnerable test app. Do not expose to the internet unprotected.</b></p>
+
+  <h2>Login</h2>
+  <input id="u" placeholder="username">
+  <input id="p" type="password" placeholder="password">
+  <button onclick="login()">Login</button>
+  <p id="loginMsg"></p>
+
+  <h2>Search products</h2>
+  <input id="q" placeholder="search">
+  <button onclick="search()">Search</button>
+  <pre id="out"></pre>
+
+  <script>
+    async function login() {
+      const r = await fetch("/api/login", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({username: u.value, password: p.value})
+      });
+      const d = await r.json();
+      loginMsg.textContent = d.message || d.error;
+    }
+    async function search() {
+      const r = await fetch("/api/search?q=" + encodeURIComponent(q.value));
+      out.textContent = JSON.stringify(await r.json(), null, 2);
+    }
+  </script>
+</body>
+</html>

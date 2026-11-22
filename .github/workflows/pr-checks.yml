@@ -1,0 +1,71 @@
+# STAGE 1: PR checks (SAST, secret scan, IaC scan). Results appear as PR annotations (Security tab + PR checks).
+# Gates block when repo variable ENFORCE_GATES == 'true' (set it to 'false' on the vuln-demo "before" run).
+name: pr-checks
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  security-events: write   # upload SARIF
+  pull-requests: read
+
+env:
+  ENFORCE: ${{ vars.ENFORCE_GATES == 'true' }}
+
+jobs:
+  semgrep:
+    runs-on: ubuntu-latest
+    container: { image: semgrep/semgrep:1.97.0 }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Semgrep SAST
+        # --severity ERROR + --error: any ERROR-level finding fails the job when enforcing
+        run: |
+          semgrep scan --config p/python --config p/dockerfile --config p/secrets \
+            --sarif --output semgrep.sarif --severity ERROR app/ || true
+          if [ "$ENFORCE" = "true" ]; then semgrep scan --config p/python --config p/dockerfile --severity ERROR --error app/; fi
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with: { sarif_file: semgrep.sarif, category: semgrep }
+
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }   # gitleaks needs full history
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        continue-on-error: ${{ vars.ENFORCE_GATES != 'true' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Trivy filesystem secret scan
+        uses: aquasecurity/trivy-action@0.28.0
+        continue-on-error: ${{ vars.ENFORCE_GATES != 'true' }}
+        with:
+          scan-type: fs
+          scanners: secret
+          scan-ref: .
+          format: sarif
+          output: trivy-fs.sarif
+          exit-code: '1'
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with: { sarif_file: trivy-fs.sarif, category: trivy-fs }
+
+  iac:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkov (Terraform)
+        uses: bridgecrewio/checkov-action@v12
+        continue-on-error: ${{ vars.ENFORCE_GATES != 'true' }}
+        with:
+          directory: terraform
+          framework: terraform
+          output_format: cli,sarif
+          output_file_path: console,checkov.sarif
+          soft_fail: false
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with: { sarif_file: checkov.sarif, category: checkov }

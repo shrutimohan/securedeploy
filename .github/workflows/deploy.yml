@@ -1,0 +1,100 @@
+# STAGE 3: verify signatures -> terraform apply (locked state) -> archive audit record to versioned S3.
+# Auto-runs after a successful build, or run manually with any digests to PROVE unsigned images are rejected.
+name: deploy
+on:
+  workflow_run:
+    workflows: [build]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      api_image:      { description: "api image ref by digest (repo@sha256:...)", required: true }
+      frontend_image: { description: "frontend image ref by digest", required: true }
+
+permissions:
+  id-token: write
+  contents: read
+  actions: read
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  IDENTITY_RE: "^https://github.com/${{ github.repository }}/.github/workflows/build.yml@refs/heads/.*"
+  ISSUER: "https://token.actions.githubusercontent.com"
+
+jobs:
+  deploy:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - uses: sigstore/cosign-installer@v3.7.0
+      - uses: hashicorp/setup-terraform@v3
+        with: { terraform_version: 1.10.5, terraform_wrapper: false }
+
+      - name: Get build evidence (auto mode)
+        if: github.event_name == 'workflow_run'
+        uses: actions/download-artifact@v4
+        with:
+          name: build-evidence
+          path: out
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve image refs
+        run: |
+          mkdir -p out
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "API_IMAGE=${{ inputs.api_image }}"           >> $GITHUB_ENV
+            echo "FE_IMAGE=${{ inputs.frontend_image }}"       >> $GITHUB_ENV
+            echo "COMMIT=${{ github.sha }}"                    >> $GITHUB_ENV
+          else
+            echo "API_IMAGE=$(jq -r .api out/digests.json)"      >> $GITHUB_ENV
+            echo "FE_IMAGE=$(jq -r .frontend out/digests.json)"  >> $GITHUB_ENV
+            echo "COMMIT=$(jq -r .commit out/digests.json)"      >> $GITHUB_ENV
+          fi
+
+      - name: Cosign verify (GATE)
+        run: |
+          # If either verification fails, the step exits non-zero and nothing below runs.
+          for pair in "api:$API_IMAGE" "frontend:$FE_IMAGE"; do
+            n=${pair%%:*}; img=${pair#*:}
+            echo "Verifying $n -> $img"
+            cosign verify --certificate-identity-regexp "$IDENTITY_RE" \
+              --certificate-oidc-issuer "$ISSUER" "$img" > out/cosign-verify-$n.json
+          done
+
+      - name: Terraform apply (state locked via S3 lockfile)
+        working-directory: terraform/main
+        env:
+          TF_VAR_api_image: ${{ env.API_IMAGE }}
+          TF_VAR_frontend_image: ${{ env.FE_IMAGE }}
+          TF_VAR_allowed_cidrs: ${{ vars.ALLOWED_CIDRS }}   # JSON list, e.g. ["1.2.3.4/32"]
+          TF_VAR_region: ${{ vars.AWS_REGION }}
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ vars.STATE_BUCKET }}" \
+            -backend-config="region=${{ vars.AWS_REGION }}"
+          terraform apply -input=false -auto-approve -lock-timeout=5m
+
+      - name: Archive audit record to S3
+        run: |
+          D=$(date -u +%Y/%m/%d)
+          KEY="$D/${{ github.run_id }}"
+          jq -n \
+            --arg commit "$COMMIT" --arg api "$API_IMAGE" --arg fe "$FE_IMAGE" \
+            --arg run "${{ github.run_id }}" --arg actor "${{ github.actor }}" \
+            --arg when "$(date -u +%FT%TZ)" \
+            --slurpfile vapi out/cosign-verify-api.json \
+            --slurpfile vfe  out/cosign-verify-frontend.json \
+            '{commit:$commit, api_image:$api, frontend_image:$fe, run_id:$run, actor:$actor, deployed_at:$when,
+              signature_verification:{api:$vapi[0], frontend:$vfe[0]}}' > out/audit-record.json
+          aws s3 cp out/audit-record.json "s3://${{ vars.AUDIT_BUCKET }}/$KEY/audit-record.json"
+          for f in out/sbom-*.spdx.json out/trivy-*.json; do
+            [ -f "$f" ] && aws s3 cp "$f" "s3://${{ vars.AUDIT_BUCKET }}/$KEY/$(basename $f)" || true
+          done
+          echo "Archived to s3://${{ vars.AUDIT_BUCKET }}/$KEY/"
